@@ -41,6 +41,7 @@ from ...logging import get_logger
 from ...clients.kvmd import KvmdClient
 
 from ... import aiotools
+from .. import init
 
 from .auth import IpmiAuthManager
 
@@ -84,6 +85,34 @@ class IpmiServer(BaseIpmiServer):  # pylint: disable=too-many-instance-attribute
         self.__sol_thread: (threading.Thread | None) = None
         self.__sol_stop = False
 
+        _, _, config = init(
+            add_help=False,
+            cli_logging=True,
+            argv=[],
+            load_msd=True,
+        )
+
+        logger = get_logger(0)
+
+        # Set parameter to control MSD(Mass Storage Device)
+        # https://docs.pikvm.org/msd/#how-to-enable-extra-drives
+        # Copied from otgmsd.__main__
+        def _get_param_path(gadget: str, instance: int, param: str) -> str:
+            return usb.get_gadget_path(gadget, usb.G_FUNCTIONS, f"mass_storage.usb{instance}/lun.0", param)
+
+        def _set_param(gadget: str, instance: int, param: str, value: str) -> None:
+            try:
+                with open(_get_param_path(gadget, instance, param), "w") as param_file:
+                    param_file.write(value + "\n")
+            except OSError as err:
+                if err.errno == errno.EBUSY:
+                    logger.error(f"Can't change {param!r} value because device is locked: {err}")
+                else:
+                    logger.error(f"Can't change {param!r} value because of: {err}")
+                return
+
+        self.__set_param = (lambda param, value: _set_param(config.otg.gadget, 1, param, value))
+
     def run(self) -> None:
         logger = get_logger(0)
         logger.info("Listening IPMI on UPD [%s]:%d ...", self.__host, self.__port)
@@ -107,6 +136,7 @@ class IpmiServer(BaseIpmiServer):  # pylint: disable=too-many-instance-attribute
             (0, 2): self.__chassis_control_handler,  # Chassis control
             (6, 0x48): self.__activate_sol_handler,  # Enable SOL
             (6, 0x49): self.__deactivate_sol_handler,  # Disable SOL
+            (0, 8): self.__raw_command_handler  # Raw command
         }.get((request["netfn"], request["command"]))
         if handler is not None:
             try:
@@ -260,3 +290,50 @@ class IpmiServer(BaseIpmiServer):  # pylint: disable=too-many-instance-attribute
             self.__close_sol_console()
         finally:
             logger.info("SOL worker finished")
+
+    def __raw_command_handler(self, request: dict, session: IpmiServerSession) -> None:
+        logger = get_logger(0)
+        data = list(request['data'])
+
+        logger.info("Received data: %s", list(map(hex, data)))
+
+        code = 0xCC  # Invalid request
+        if data == [0x03, 0x08]:
+            logger.info("Received timer disable request. This is no op.")
+            code = 0
+        elif data == [0x05, 0xa0, 0x04, 0x00, 0x00, 0x00]:
+            logger.info("Received set PXE boot device. This mounts USB(PXE image) device.")
+            self.__mount_disk("/root/ipxe.iso")
+            code = 0
+        elif data == [0x05, 0xe0, 0x04, 0x00, 0x00, 0x00]:
+            logger.info("Received set PXE boot device (EFI). This mounts USB(PXE image) device.")
+            self.__mount_disk("/root/ipxe.iso")
+            code = 0
+        elif data == [0x05, 0xa0, 0x08, 0x00, 0x00, 0x00]:
+            logger.info("Received set DISK boot device. This unmounts USB(PXE image) device if exists.")
+            self.__unmount_disk()
+            code = 0
+        elif data == [0x05, 0xe0, 0x08, 0x00, 0x00, 0x00]:
+            logger.info("Received set DISK boot device (EFI). This unmounts USB(PXE image) device if exists.")
+            self.__unmount_disk()
+            code = 0
+
+        logger.info("Raw command handler response: %s",  code)
+        session.send_ipmi_response(code=code)
+
+    def __mount_disk(self, image: str):
+        logger = get_logger(0)
+        logger.info(f"Try to mount disk image {image}")
+
+        if not os.path.isfile(image):
+            logger.error(f"Not a file: {image}")
+            return
+
+        self.__set_param('ro', '1')
+        self.__set_param("file", image)
+
+    def __unmount_disk(self, image: str):
+        logger = get_logger(0)
+        logger.info(f"Try to unmount disk image {image}")
+
+        self.__set_param("forced_eject", "")
